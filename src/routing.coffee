@@ -2,6 +2,7 @@
 
 # map
 map = null
+map_under_drag = false # drag state
 
 # Background map layers.
 layers = {}
@@ -24,6 +25,44 @@ vehicles = []
 previous_positions = []
 interpolations = []
 
+subscribed_routes = []
+
+upkeepTimer = null
+
+urlHash = ->
+  return window.location.hash.replace '#', ''
+
+siri_to_live = (vehicle) ->
+    vehicle:
+        id: vehicle.MonitoredVehicleJourney.VehicleRef.value
+    trip:
+        route: vehicle.MonitoredVehicleJourney.LineRef.value
+    position:
+        latitude: vehicle.MonitoredVehicleJourney.VehicleLocation.Latitude
+        longitude: vehicle.MonitoredVehicleJourney.VehicleLocation.Longitude
+        bearing: vehicle.MonitoredVehicleJourney.Bearing
+
+
+interpret_jore = (routeId) ->
+    if citynavi.config.id != "helsinki"
+        # no JORE codes in use, assume bus
+        [mode, routeType, route] = ["BUS", 3, routeId]
+    else if routeId?.match /^1019/
+        [mode, routeType, route] = ["FERRY", 4, "Ferry"]
+    else if routeId?.match /^1300/
+        [mode, routeType, route] = ["SUBWAY", 1, routeId.substring(4,5)]
+    else if routeId?.match /^300/
+        [mode, routeType, route] = ["RAIL", 2, routeId.substring(4,5)]
+    else if routeId?.match /^10(0|10)/
+        [mode, routeType, route] = ["TRAM", 0, "#{parseInt routeId.substring(2,4)}"]
+    else if routeId?.match /^(1|2|4).../
+        [mode, routeType, route] = ["BUS", 3, "#{parseInt routeId.substring(1)}"]
+    else
+        # unknown, assume bus
+        [mode, routeType, route] = ["BUS", 3, routeId]
+
+    return [mode, routeType, route]
+
 ## Events before a page is shown
 
 # set a class on the html root element based on the active page, for css use
@@ -43,13 +82,19 @@ $(document).bind "pagebeforechange", (e, data) ->
     u = $.mobile.path.parseUrl(data.toPage)
 
     if u.hash.indexOf('#navigation-page') == 0
-        # start from the beginning
-        start_bounds = L.latLngBounds([sourceMarker.getLatLng()])
+        # determine bounds for initial map view
+        start_bounds = L.latLngBounds([])
+        # include the source marker
+        if sourceMarker?
+            start_bounds.extend sourceMarker.getLatLng()
         # include the current device position as well
         if position_bounds?
             start_bounds.extend position_bounds
-        zoom = Math.min(map.getBoundsZoom(start_bounds), 18)
-        map.setView(start_bounds.getCenter(), zoom)
+        # XXX include at least the start of the first leg as well
+        # if we got bounds data, zoom to that (no closer than level 18 though)
+        if start_bounds.isValid()
+            zoom = Math.min(map.getBoundsZoom(start_bounds), 18)
+            map.setView(start_bounds.getCenter(), zoom)
 
     # The "#map-page?service" is used with the palvelukartta.coffee.
     if u.hash.indexOf('#map-page?service=') == 0
@@ -74,7 +119,7 @@ $(document).bind "pagebeforechange", (e, data) ->
 # This event happens after the pagebeforechange event.
 $('#map-page').bind 'pageshow', (e, data) ->
     console.log "#map-page pageshow"
-
+    $('.ui-loader').hide();
     resize_map()
 
     if targetMarker? # Check that typeof targetMarker !== "undefined" && targetMarker !== null
@@ -87,15 +132,21 @@ $('#map-page').bind 'pageshow', (e, data) ->
         sourceMarker.openPopup()
 
     if routeLayer?
-        map.fitBounds(routeLayer.getBounds())
+        mapfitBounds(routeLayer.getBounds())
     else if position_point?
         zoom = Math.min(map.getBoundsZoom(position_bounds), 15)
         map.setView(position_point, zoom)
 
-$('#map-page [data-rel="back"]').on 'click', (e) ->
-        if routeLayer?
-            map.removeLayer routeLayer
-            routeLayer = null
+
+$('#map-page [data-rel="back"]').on 'click', (e) -> reset_map()
+
+reset_map = () ->
+        reset_route()
+
+        $('.route-list ul').empty().hide().parent().removeClass("active")
+
+        $('.control-details').empty()
+
         if sourceMarker?
             map.removeLayer sourceMarker
             sourceMarker = null
@@ -111,8 +162,60 @@ $('#map-page [data-rel="back"]').on 'click', (e) ->
             map.setView(position_point, zoom)
             set_source_marker(position_point, {accuracy: positionMarker.getRadius()})
         else
-            map.setView(citynavi.config.center, 10)
+            map.setView(citynavi.config.center, citynavi.config.min_zoom)
 
+
+reset_route = () ->
+
+    console.log "resetting route"
+
+    if upkeepTimer?
+        clearTimeout upkeepTimer
+        upkeepTimer = null
+
+    for interpolation in interpolations
+        clearTimeout(interpolation)
+
+    if routeLayer?
+        map.removeLayer routeLayer
+        routeLayer = null
+        citynavi.set_itinerary null
+
+    #citynavi.realtime?.unsubscribe_all_routes
+    subscribed_routes = []
+    
+    vehicles = []
+    previous_positions = []
+    interpolations = []
+
+bus_departures = null
+
+$.getJSON 'static/data/bus_departures.json', (data) ->
+    bus_departures = jsonh.unpack data
+    console.log bus_departures
+
+$('#live-page').bind 'pageshow', (e, data) ->
+    map.setView(citynavi.config.center, citynavi.config.min_zoom)
+    console.log "live map - subscribing to all vehicles"
+    routeLayer = L.featureGroup().addTo(map)
+    $('.ui-loader').hide();
+    $.getJSON citynavi.config.siri_url, (data) ->
+        for vehicle in data.Siri.ServiceDelivery.VehicleMonitoringDelivery[0].VehicleActivity
+            console.log "SIRI server returned " + vehicle.MonitoredVehicleJourney.LineRef.value
+            msg = siri_to_live(vehicle)
+            handle_vehicle_update true, msg
+                    
+        upkeepTimer = setTimeout (-> upkeep_vehicle_locations()), 1000  
+
+        console.log "Got #{data.Siri.ServiceDelivery.VehicleMonitoringDelivery[0].VehicleActivity.length} vehicles in #{citynavi.config.name}"
+        #sub = citynavi.realtime?.client.subscribe "/location/#{citynavi.config.id}/**", (msg) ->
+        #    handle_vehicle_update false, msg
+        #$('#live-page [data-rel="back"]').on 'click', (e) ->
+        #    sub.cancel()
+
+
+$('#live-page [data-rel="back"]').on 'click', (e) ->
+    reset_map()
 
 ## Utilities
 
@@ -230,10 +333,10 @@ marker_changed = (options) ->
     if sourceMarker? and targetMarker?
         find_route sourceMarker.getLatLng(), targetMarker.getLatLng(), (route) ->
             if options?.zoomToFit
-                map.fitBounds(route.getBounds())
+                mapfitBounds(route.getBounds())
             else if options?.zoomToShow
                 if not map.getBounds().contains(route.getBounds())
-                    map.fitBounds(route.getBounds())
+                    mapfitBounds(route.getBounds())
 
 
 ## Routing
@@ -347,7 +450,7 @@ offline_cleanup = (data) ->
             if leg.startTime - time > 1000
                 wait_time = leg.startTime-time
                 time = leg.endTime
-		# add the waiting time as a separate leg
+        # add the waiting time as a separate leg
                 new_legs.push create_wait_leg leg.startTime - wait_time,
                     wait_time, leg.legGeometry.points[0], leg.from.name
             new_legs.push leg
@@ -394,6 +497,12 @@ otp_cleanup = (data) ->
             # Route received from OTP is encoded so it needs to be decoded.
             leg.legGeometry.points = decode_polyline(leg.legGeometry.points, 2)
 
+            if leg.mode == "BUS"
+                line = refine_line_to_match_siri leg.route, leg.from.stopCode, leg.from.departure
+                leg.route = line
+                leg.routeId = line
+                leg.routeShortName = line
+
             # if there's unaccounted time before a walking leg
             if leg.startTime - time > 1000 and leg.routeType == null
                 # move non-transport legs to occur before wait time
@@ -409,7 +518,7 @@ otp_cleanup = (data) ->
             else if leg.startTime - time > 1000
                 wait_time = leg.startTime-time
                 time = leg.endTime
-		# add the waiting time as a separate leg
+        # add the waiting time as a separate leg
                 new_legs.push create_wait_leg leg.startTime - wait_time,
                     wait_time, leg.legGeometry.points[0], leg.from.name
                 new_legs.push leg
@@ -419,11 +528,35 @@ otp_cleanup = (data) ->
         itinerary.legs = new_legs
     return data
 
+refine_line_to_match_siri = (route_id, stop_id, departure_time) ->
+    stop_id = parseInt(stop_id, 10).toString() #to remove leading zeros if any
+    if bus_departures
+        d_time = moment(departure_time).format("HH:mm")
+        weekday = moment(departure_time).isoWeekday()
+        malasu = ""
+        if weekday == 1 or weekday == 2 or weekday == 3 or weekday == 4 or weekday == 5
+            malasu = "ma"
+        else if weekday == 6
+            malasu = "la"
+        else
+            malasu = "su"
+        for departure in bus_departures
+            if route_id == departure.line and stop_id == departure.stop and malasu == departure.malasu and d_time == departure.departureTime
+                return departure.line + departure.variantLetter
 
+        console.log "did not find departure for", route_id, stop_id, malasu, moment(departure_time).format("HH:mm")
+        return route_id
+    else
+        return route_id
+    
 # Called from marker_changed function when there are both source marker and target marker
 # on the map and either of them has been set to a new place.
 find_route = (source, target, callback) ->
     console.log "find_route", source.toString(), target.toString(), callback?
+    #if there is old vehicle position interpolation data then clear it
+    reset_route()
+    #routeLayer = L.featureGroup().addTo(map)
+
     if window.citynavi.reach?
         find_route_impl = find_route_offline
     else
@@ -461,6 +594,7 @@ find_route_otp = (source, target, callback) ->
     # # http://opentripplanner.org/apidoc/0.9.2/resource_Planner.html
     $.getJSON citynavi.config.otp_base_url + "plan", params, (data) ->
         console.log "opentripplanner callback got data"
+        console.log data
         data = otp_cleanup(data)
         display_route_result(data)
         if callback
@@ -497,10 +631,11 @@ display_route_result = (data) ->
             if index == 0
                 polylines = render_route_layer(itinerary, routeLayer)
                 $list.parent().addClass("active")
+                citynavi.set_itinerary itinerary
             else
                 polylines = null
             $list.css('width', itinerary.duration/maxDuration*100+"%")
-            render_route_buttons($list, itinerary, routeLayer, polylines)
+            render_route_buttons($list, itinerary, routeLayer, polylines, maxDuration)
 
     resize_map() # adjust map height to match space left by itineraries
 
@@ -512,8 +647,18 @@ render_route_layer = (itinerary, routeLayer) ->
     vehicles = []
     previous_positions = []
 
+    sum = (xs) -> _.reduce(xs, ((x, y) -> x+y), 0)
+    total_walking_distance = sum(leg.distance for leg in legs when leg.distance and not leg.routeType?)
+    total_walking_duration = sum(leg.duration for leg in legs when leg.distance and not leg.routeType?)
+
+    route_includes_transit = _.any(leg.routeType? for leg in legs)
+
+    # coffeescript parser would fail with string interpolation syntax here:
+    $('.control-details').html("<div class='route-details'><div>Itinerary:&nbsp;&nbsp;<i><img src='static/images/clock.svg'> "+Math.ceil(itinerary.duration/1000/60)+"min<\/i>&nbsp;&nbsp;<i><img src='static/images/walking.svg'> "+Math.ceil(total_walking_duration/1000/60)+"min / "+Math.ceil(total_walking_distance/100)/10+"km<\/i></div></div>")
+
     for leg in legs
         do (leg) ->
+            #console.log "handling leg for route " + leg.routeId
             uid = Math.floor(Math.random()*1000000)
             points = (new L.LatLng(point[0]*1e-5, point[1]*1e-5) for point in leg.legGeometry.points)
             color = google_colors[leg.routeType ? leg.mode]
@@ -528,7 +673,7 @@ render_route_layer = (itinerary, routeLayer) ->
             # Make zooming to the leg via click possible.
             polyline = new L.Polyline(points, {color: color, opacity: 0.4, dashArray: dashArray})
                 .on 'click', (e) ->
-                    map.fitBounds(polyline.getBounds())
+                    mapfitBounds(polyline.getBounds())
                     if marker?
                         marker.openPopup()
             polyline.addTo(routeLayer)
@@ -538,17 +683,18 @@ render_route_layer = (itinerary, routeLayer) ->
                 last_stop = leg.to
                 point = {y: stop.lat, x: stop.lon}
                 icon = L.divIcon({className: "navigator-div-icon"})
-                label = "<span style='font-size: 24px; padding-right: 6px'><img src='static/images/#{google_icons[leg.routeType ? leg.mode]}' style='vertical-align: sub; height: 24px '/> #{leg.route}</span>"
+                label = "<span style='font-size: 24px;'><img src='static/images/#{google_icons[leg.routeType ? leg.mode]}' style='vertical-align: sub; height: 24px'/><span>#{leg.route}</span></span>"
 
                 # Define function to calculate the transit arrival time and update the element
                 # that has uid specific to this leg once per second by calling this function
                 # again. Uid has been calculated randomly above in the beginning of the for loop.
                 secondsCounter = () ->
-                    if leg.startTime >= moment()
-                        duration = moment.duration(leg.startTime-moment())
+                    now = citynavi.time()
+                    if leg.startTime >= now
+                        duration = moment.duration(leg.startTime-now)
                         sign = ""
                     else
-                        duration = moment.duration(moment()-leg.startTime)
+                        duration = moment.duration(now-leg.startTime)
                         sign = "-"
                     seconds = (duration.seconds()+100).toString().substring(1)
                     minutes = duration.minutes()
@@ -564,7 +710,7 @@ render_route_layer = (itinerary, routeLayer) ->
 
                 # for transit and at itinerary start also walking, show counter
                 if leg.routeType? or leg == legs[0]
-                    marker.bindLabel(label + "<span id='counter#{uid}' class='counter firstleg#{leg == legs[0]}'></span>", {noHide: true})
+                    marker.bindLabel(label + "<span id='counter#{uid}' class='counter firstleg#{leg == legs[0]} transitroute#{route_includes_transit}'></span>", {noHide: true})
                     .showLabel()
 
                     secondsCounter() # Start updating the time in the marker.
@@ -587,15 +733,80 @@ render_route_layer = (itinerary, routeLayer) ->
                 # that has been defined in the realtime.coffee file. The routeId can be, for example,
                 # 23 for a bus at Tampere, Finland.
                 console.log "subscribing to #{leg.routeId}"
-                citynavi.realtime?.subscribe_route leg.routeId, (msg) ->
+
+                strippedRouteId = leg.routeId.replace(/\D/g,'');
+                
+                if not (strippedRouteId of subscribed_routes)
+                      subscribed_routes[strippedRouteId] = true
+
+#                dataCall = $.getJSON citynavi.config.siri_url, {lineRef: leg.routeId}, (data) ->
+#                    console.log "got json data"
+#                    for vehicle in data.Siri.ServiceDelivery.VehicleMonitoringDelivery[0].VehicleActivity
+                        #console.log "For route " + leg.routeId + " SIRI server returned " + vehicle.MonitoredVehicleJourney.LineRef.value
+#                        handle_vehicle_update true, siri_to_live(vehicle)
+
+#                    console.log "Got #{data.Siri.ServiceDelivery.VehicleMonitoringDelivery[0].VehicleActivity.length} vehicles on route #{leg.routeId}"
+                    
+#                    if not (leg.routeId of subscribed_routes)
+#                      subscribed_routes[leg.routeId] = true
+                      
+#                      console.log "Setting timeout for route " + leg.routeId
+                      
+#                      setTimeout (-> upkeep_vehicle_locations(leg.routeId)), 1000
+                    
+                    #citynavi.realtime?.subscribe_route leg.routeId, (msg) ->
+                    #    handle_vehicle_update false, msg
+#                dataCall.fail (d, textStatus, error) ->
+#                    console.log "getJSON failed, status: " + textStatus + ", error: "+error
+
+            # The row causes all legs polylines to be returned as array from the render_route_layer function.
+            # polyline is graphical representation of the leg.
+            polyline
+
+    upkeep_vehicle_locations()
+
+upkeep_vehicle_locations = ->
+    #console.log "page hash is " + urlHash()
+
+    if urlHash() == "live-page"
+        $.getJSON citynavi.config.siri_url, (data) ->
+            for vehicle in data.Siri.ServiceDelivery.VehicleMonitoringDelivery[0].VehicleActivity
+                #console.log "For route " + route + " SIRI server returned " + vehicle.MonitoredVehicleJourney.LineRef.value
+              
+                handle_vehicle_update false, siri_to_live(vehicle)
+
+            #$('.ui-loader').show();
+            upkeepTimer = setTimeout (-> upkeep_vehicle_locations()), 1000
+        #$.ajaxSetup {cache: true}
+    else
+        #$.ajaxSetup {cache: false}
+        $.getJSON citynavi.config.siri_url, (data) ->
+            for vehicle in data.Siri.ServiceDelivery.VehicleMonitoringDelivery[0].VehicleActivity
+                #console.log "For route " + route + " SIRI server returned " + vehicle.MonitoredVehicleJourney.LineRef.value
+              
+                strippedValue = vehicle.MonitoredVehicleJourney.LineRef.value.replace(/\D/g,'');
+              
+                if subscribed_routes[strippedValue]?
+                    handle_vehicle_update false, siri_to_live(vehicle)
+
+            #$('.ui-loader').show();
+            upkeepTimer = setTimeout (-> upkeep_vehicle_locations()), 1000
+        #$.ajaxSetup {cache: true}
+
+handle_vehicle_update = (initial, msg) ->
+
+                    #console.log "handle_vehicle_update called with msg " + msg
+
                     id = msg.vehicle.id
                     pos = [msg.position.latitude, msg.position.longitude]
+                    [mode, routeType, route] = interpret_jore(msg.trip.route)
                     if not (id of vehicles) # Data for a new vehicle was given from the server
                         # Draw icon for the vehicle
-                        icon = L.divIcon({className: "navigator-div-icon", html: "<img src='static/images/#{google_icons[leg.routeType ? leg.mode]}' height='20px' />"})
+                        icon = L.divIcon({className: "navigator-div-icon", html: "<div id='vehicle-#{id}' style='background: #{google_colors[routeType ? mode]}'><span>#{route}</span><img src='static/images/#{google_icons[routeType ? mode]}' height='20px' /></div>"})
                         vehicles[id] = L.marker(pos, {icon: icon})
                             .addTo(routeLayer)
-                        console.log "new vehicle #{id} on route #{leg.routeId}"
+                        if not initial
+                            console.log "new vehicle #{id} on route #{msg.trip.route}"
                     else
                         # Update the vehicle icon's place on the map.
                         # Use interpolation to make updates smoother.
@@ -604,7 +815,7 @@ render_route_layer = (itinerary, routeLayer) ->
                         interpolation = (index, id, old_pos) ->
                             lat = old_pos[0]+(pos[0]-old_pos[0])*(index/steps)
                             lng = old_pos[1]+(pos[1]-old_pos[1])*(index/steps)
-                            vehicles[id].setLatLng([lat, lng])
+                            vehicles[id]?.setLatLng([lat, lng])
                             if index < steps
                                 interpolations[id] = setTimeout (-> interpolation index+1, id, old_pos), 1000
                             else
@@ -614,16 +825,16 @@ render_route_layer = (itinerary, routeLayer) ->
                                 clearTimeout(interpolations[id])
                             interpolation 1, id, old_pos
                     previous_positions[id] = pos
-            # The row causes all legs polylines to be returned as array from the render_route_layer function.
-            # polyline is graphical representation of the leg.
-            polyline
+                    $("#vehicle-#{id}").css('transform', "rotate(#{msg.position.bearing+90}deg)")
+#                    $("#vehicle-#{id} img").css('transform', "rotate(-#{msg.position.bearing+90}deg)")
+                    $("#vehicle-#{id} span").css('transform', "rotate(-#{msg.position.bearing+90}deg)")
 
 # Renders the route buttons in the map page footer.
 # Itienary is the  itienary suggested for the user to get from source to target.
 # Route_layer is needed to resize the map when info is added to the footer here.
 # polylines contains graphical representation of the itienary legs.
-render_route_buttons = ($list, itinerary, route_layer, polylines) ->
-    trip_duration = itinerary.duration
+render_route_buttons = ($list, itinerary, route_layer, polylines, max_duration) ->
+    trip_duration = itinerary.duration*1000
     trip_start = itinerary.startTime
 
     length = itinerary.legs.length + 1 # Include space for the "Total" button.
@@ -634,6 +845,10 @@ render_route_buttons = ($list, itinerary, route_layer, polylines) ->
 #    $full_trip.css("left", "{0}%")
 #    $full_trip.css("width", "#{1/length*100}%")
 
+    console.log "trip duration: " + trip_duration
+    console.log "trip start: " + trip_start
+    console.log 'moment(trip_start+trip_duration).format("HH:mm"): ' + moment(trip_start+trip_duration).format("HH:mm")
+
     # fixed-width style:
     $full_trip = $("<li class='leg'><div class='leg-bar' style='margin-right: 3px'><i style='font-weight: lighter'><img />Total</i><div class='leg-indicator'>#{Math.ceil(trip_duration/1000/60)}min</div></div></li>")
     $full_trip.css("left", "{0}%")
@@ -642,7 +857,7 @@ render_route_buttons = ($list, itinerary, route_layer, polylines) ->
     # Add event handler to zoom to show whole itienary on map if
     # there is no other click event defined for a button. The "Total" button is such.
     $full_trip.click (e) ->
-        map.fitBounds(route_layer.getBounds())
+        mapfitBounds(route_layer.getBounds())
         sourceMarker.closePopup()
         targetMarker.closePopup()
         sourceMarker.openPopup()
@@ -651,16 +866,14 @@ render_route_buttons = ($list, itinerary, route_layer, polylines) ->
     # label with itinerary start time
     $start = $("<li class='leg'><div class='leg-bar'><i><img src='static/images/walking.svg' height='100%' style='visibility: hidden' /></i><div class='leg-indicator' style='font-style: italic; text-align: left'>#{moment(trip_start).format("HH:mm")}</div></div></li>")
     $start.css("left", "#{0}%")
-    $start.css("width", "#{10}%")
+    $start.css("width", "#{15}%")
     $list.append($start)
 
     # label with itinerary end time
     $end = $("<li class='leg'><div class='leg-bar'><i><img src='static/images/walking.svg' height='100%' style='visibility: hidden' /></i><div class='leg-indicator' style='font-style: italic; text-align: right'>#{moment(trip_start+trip_duration).format("HH:mm")}</div></div></li>")
     $end.css("right", "#{0}%")
-    $end.css("width", "#{10}%")
+    $end.css("width", "#{15}%")
     $list.append($end)
-
-    max_duration = trip_duration # use all width for trip duration
 
     # Draw a button for each leg.
     for leg, index in itinerary.legs
@@ -674,12 +887,12 @@ render_route_buttons = ($list, itinerary, route_layer, polylines) ->
         color = google_colors[leg.routeType ? leg.mode]
 
 # GoodEnoughJourneyPlanner style:
-        leg_start = (leg.startTime-trip_start)/max_duration
-        leg_duration = leg.duration/max_duration
+        leg_start = (leg.startTime-trip_start)/trip_duration
+        leg_duration = leg.duration*1000/trip_duration
         leg_label = "<img src='static/images/#{icon_name}' height='100%' />"
 
         # for long non-transit legs, display distance in place of route
-        if not leg.routeType? and leg.distance? and leg_duration > 0.2
+        if not leg.routeType? and leg.distance? and leg.duration*1000/max_duration > 0.35
             leg_subscript = "<div class='leg-indicator' style='font-weight: normal'>#{Math.ceil(leg.distance/100)/10}km</div>"
         else
             leg_subscript = "<div class='leg-indicator'>#{leg.route}</div>"
@@ -688,7 +901,7 @@ render_route_buttons = ($list, itinerary, route_layer, polylines) ->
 #        leg_start = (index+1)/length # leg_start and leg_duration are used for positioning the buttons.
 #        leg_duration = 1/length
 #        leg_label = "<img src='static/images/#{icon_name}' height='100%' /> #{leg.route}"
-#        leg_subscript = "#{Math.ceil(leg.duration/1000/60)}min"
+#        leg_subscript = "#{Math.ceil(leg.duration/60)}min"
 
         $leg = $("<li class='leg'><div style='background: #{color};' class='leg-bar'><i>#{leg_label}</i>#{leg_subscript}</div></li>")
 
@@ -706,7 +919,8 @@ render_route_buttons = ($list, itinerary, route_layer, polylines) ->
                 $list.parent().siblings().removeClass('active')
                 polylines = render_route_layer(itinerary, routeLayer)
                 $list.parent().addClass('active')
-                map.fitBounds(routeLayer.getBounds())
+                mapfitBounds(routeLayer.getBounds())
+                citynavi.set_itinerary itinerary
 
         # if the i is a block, it needs a separate event handler
         $leg.find('i').click (e) ->
@@ -745,7 +959,7 @@ find_route_reittiopas = (source, target, callback) ->
             color = transport_colors[leg.type]
             polyline = new L.Polyline(points, {color: color})
                 .on 'click', (e) ->
-                    map.fitBounds(e.target.getBounds())
+                    mapfitBounds(e.target.getBounds())
                     if marker?
                         marker.openPopup()
             polyline.addTo(route)
@@ -757,7 +971,7 @@ find_route_reittiopas = (source, target, callback) ->
                     .bindPopup("<b><Time: #{format_time(stop.depTime)}</b><br /><b>From:</b> {stop.name}<br /><b>To:</b> #{last_stop.name}")
 
         if not map.getBounds().contains(route.getBounds())
-            map.fitBounds(route.getBounds())
+            mapfitBounds(route.getBounds())
 
 
 ## Map initialisation
@@ -788,12 +1002,37 @@ $(window).on 'resize', () ->
 
 # Create a new Leaflet map and set it's center point to the
 # location defined in the config.coffee
-window.map_dbg = map = L.map('map', {minZoom: 10, zoomControl: false, attributionControl: false})
-    .setView(citynavi.config.center, 10)
+window.map_dbg = map = L.map('map', {minZoom: citynavi.config.min_zoom, zoomControl: false, attributionControl: false})
+    .setView(citynavi.config.center, citynavi.config.min_zoom)
+
+
+map.whenReady () ->
+    console.log "map ready"
+    setTimeout () -> map.fire 'zoomend', 0
+
+# set a class on the map root element based on the current zoom, for css use
+map.on 'zoomend', (e) ->
+    console.log "zoomend"
+    zoom = map.getZoom()
+    minzooms = ("minzoom-"+i for i in [0..zoom]).join(" ")
+    # XXX toggle instead of set:
+    $('#map').attr('class', "leaflet-container leaflet-fade-anim "+minzooms)
 
 $(document).ready () ->
     resize_map()
     map.invalidateSize()
+
+DetailsControl = L.Control.extend
+    options: {
+        position: 'topleft'
+    },
+
+    onAdd: (map) ->
+        $container = $("<div class='control-details'></div>")
+        return $container.get(0)
+
+new DetailsControl().addTo(map)
+new DetailsControl({position: 'topright'}).addTo(map)
 
 L.control.attribution({position: 'bottomright'}).addTo(map)
 
@@ -814,7 +1053,7 @@ create_tile_layer = (map_config) ->
 for key, value of citynavi.config.maps
     layers[key] = create_tile_layer(value)
 
-layers["cloudmade"].addTo(map)
+layers["osm"].addTo(map)
 
 # Use the leafletOsmNotes() function in file file "static/js/leaflet-osm-notes.js"
 # to create layer for showing error notes from OSM in the map.
@@ -873,8 +1112,15 @@ transform_location = (point) ->
             point.lng = t.dest.lng
             return
 
+map.on 'dragstart', (e) ->
+    map_under_drag = true
+map.on 'dragend', (e) ->
+    map_under_drag = false
+
 map.on 'locationerror', (e) ->
-    alert(e.message)
+    if e.message != "Geolocation error: The operation couldn’t be completed. (kCLErrorDomain error 0.)." &&
+       e.message != "Geolocation error: Timeout expired."
+        alert(e.message)
 
 # Triggered whenever user location has changed.
 map.on 'locationfound', (e) ->
@@ -905,6 +1151,12 @@ map.on 'locationfound', (e) ->
         radius = 50 # draw small grey circle
         measure = "nowhere near"
         e.bounds = L.latLngBounds(bbox_sw, bbox_ne)
+
+    # if position was visible, pan to keep it visible
+    if positionMarker? && map.getBounds().contains(positionMarker.getLatLng())
+        if not map.getBounds().contains(e.bounds)
+            if not map_under_drag
+                map.panTo(point)
 
     # save latest position info for later page change
     position_point = point
@@ -987,6 +1239,14 @@ map.on 'contextmenu', (e) ->
         osmnotes.addTo(map)
         # Comment box with id "comment-box" has been defined in the index.html.
         $('#comment-box').show()
+        hide = () ->
+            $('#comment-box').hide()
+            resize_map() # causes map redraw & notes update
+            set_comment_marker()
+        $('#comment-box .cancel-button').unbind 'click'
+        $('#comment-box .cancel-button').bind 'click', ->
+            hide()
+            return false # event handled
         $('#comment-box').unbind 'submit'
         $('#comment-box').bind 'submit', ->
             text = $('#comment-box textarea').val()
@@ -994,10 +1254,300 @@ map.on 'contextmenu', (e) ->
             lon = commentMarker.getLatLng().lng
             uri = osm_notes_url
             $.post uri, {lat: lat, lon: lon, text: text}, ()->
-                $('#comment-box').hide()
-                resize_map() # causes map redraw & notes update
-                set_comment_marker()
+                $('#comment-box textarea').val("")
+                hide()
             return false # don't submit form
+        $.mobile.changePage '#map-page'
         resize_map()
         map.removeLayer(contextmenu)
         return false
+
+mapfitBounds = (bounds) ->
+    # map.fitBounds taking into account the map area that is covered by
+    # the header, the footer or the trip details control
+    topPadding = $(".ui-header").height() + $(".control-details").height()
+    bottomPadding = $(".ui-footer").height()
+    map.fitBounds bounds,
+        paddingTopLeft: [0, topPadding]
+        paddingBottomRight: [0, bottomPadding]
+
+simulation_timestep_default = 10000
+
+simulation_timeoutId = null
+simulation_timestep = simulation_timestep_default
+
+$('.pause-navigation-link').on 'click', (e) ->
+    if $('.pause-navigation-link').attr('data-icon') == 'pause'
+        console.log "Pausing"
+        simulation_timestep = 0
+        $('.pause-navigation-link').attr 'data-icon', 'play'
+        $('.pause-navigation-link .ui-icon').attr 'class', 'ui-icon ui-icon-play ui-icon-shadow'
+        $('.pause-navigation-link').buttonMarkup 'option', 'icon', 'play'
+        $('.pause-navigation-link .ui-btn-text').text "Continue"
+    else
+        console.log "Playing"
+        simulation_timestep = simulation_timestep_default
+        $('.pause-navigation-link').attr 'data-icon', 'pause'
+        $('.pause-navigation-link .ui-icon').attr 'class', 'ui-icon ui-icon-pause ui-icon-shadow'
+        $('.pause-navigation-link').buttonMarkup 'option', 'icon', 'pause'
+        $('.pause-navigation-link .ui-btn-text').text "Pause"
+
+$('.journey-preview-link').on 'click', (e) ->
+    itinerary = citynavi.get_itinerary()
+
+    for route_id of citynavi.realtime?.subs or []
+        citynavi.realtime.unsubscribe_route route_id
+    for vehicle in vehicles
+        routeLayer.removeLayer(vehicle)
+    vehicles = []
+    previous_positions = []
+    interpolations = []
+
+    console.log "Starting simulation"
+    simulation_step(itinerary, itinerary.startTime - 60*1000)
+
+
+lastLeg = null
+currentStep = null
+currentStepIndex = null
+speak_queue = []
+
+$('#navigation-page [data-rel="back"]').on 'click', (e) ->
+    if simulation_timeoutId?
+        clearTimeout simulation_timeoutId
+        simulation_timeoutId = null
+        citynavi.set_simulation_time null
+    if positionMarker?
+        map.removeLayer positionMarker
+        map.removeLayer positionMarker2
+        positionMarker = null
+        position_point = null
+        # XXX restore latest real geolocation
+        citynavi.set_source_location null
+
+    lastLeg = null
+    currentStep = null
+    currentStepIndex = null
+    speak_queue = []
+
+$('#use-speech').change () ->
+    if $('#use-speech').attr('checked')
+        if not meSpeak?
+            xhr = $.ajax
+                url: "mespeak/mespeak.js"
+                dataType: "script"
+                cache: true
+
+            xhr.done () ->
+                if meSpeak?
+                    meSpeak?.loadConfig("mespeak/mespeak_config.json");
+#                    meSpeak?.loadVoice("mespeak/voices/en/en.json");
+                    meSpeak?.loadVoice("mespeak/voices/fi.json");
+                    console.log "meSpeak loaded"
+                else
+                    console.log "meSpeak failed"
+
+            xhr.fail (jqXHR, textStatus, errorThrown) ->
+                console.log "meSpeak failed to load: #{textStatus} #{errorThrown}"
+
+
+speak_real = (text) ->
+    if meSpeak? and $('#use-speech').attr('checked')
+        console.log("*** Speaking", text)
+        meSpeak.speak(text, {}, speak_callback)
+    else
+        console.log("*** Not speaking", text)
+        speak_callback() # done immediately as doing nothing
+
+display_detail = (text) ->
+    $('.control-details').html("<div class='route-details'><div>#{text}</div></div>")
+
+speak = (text) ->
+    if speak_queue.length == 0
+        speak_queue.unshift(text)
+        speak_real(text)
+    else
+        speak_queue.unshift(text)
+
+speak_callback = () ->
+    console.log "... speech done."
+    speak_queue.pop()
+    if speak_queue.length != 0
+        text = speak_queue[0]
+        speak_real(text)
+
+dir_to_finnish =
+    DEPART: ""
+    NORTH: "Kulje pohjoiseen katua"
+    SOUTH: "Kulje etelään katua"
+    EAST: "Kulje itään katua"
+    WEST: "Kulje länteen katua"
+    NORTHWEST: "Kulje luoteeseen katua"
+    SOUTHEAST: "Kulje kaakkoon katua"
+    NORTHEAST: "Kulje koilliseen katua"
+    SOUTHWEST: "Kulje lounaaseen katua"
+    CONTINUE: "Jatka eteenpäin kadulle"
+    LEFT: "Käänny vasemmalle kadulle"
+    RIGHT: "Käänny oikealle kadulle"
+    SLIGHTLY_LEFT: "Käänny viistosti vasemmalle kadulle"
+    SLIGHTLY_RIGHT: "Käänny viistosti oikealle kadulle"
+    HARD_LEFT: "Käänny jyrkästi vasemmalle kadulle"
+    HARD_RIGHT: "Käänny jyrkästi oikealle kadulle"
+    UTURN_LEFT: "Tee U-käännös vasemmalle kadulle"
+    UTURN_RIGHT: "Tee U-käännös oikealle kadulle"
+    CIRCLE_CLOCKWISE: "Kulje myötäpäivään liikenneympyrää"
+    CIRCLE_COUNTERCLOCKWISE: "Kulje vastapäivään liikenneympyrää"
+    ELEVATOR: "Mene hissillä kadulle"
+
+path_to_finnish =
+    "bike path": "pyörätie"
+    path: "polku"
+    "open area": "aukio"
+    bridleway: "kärrypolku"
+
+    platform: "laituri"
+
+    footbridge: "ylikulkusilta"
+    underpass: "alikulku"
+
+    road: "tie"
+    ramp: "liittymä"
+    link: "linkki"
+    "service road": "pihatie"
+    alley: "kuja"
+    "parking aisle": "parkkipaikka"
+    byway: "sivutie"
+    track: "ajoura"
+    sidewalk: "jalkakäytävä"
+
+    steps: "portaat"
+
+    cycleway: "pyörätie"
+
+    "Elevator": "hissi"
+
+    "default level": "maantaso"
+
+location_to_finnish = (location) ->
+    corner = location.name.match(/corner of (.*) and (.*)/)
+
+    if corner?
+        return "katujen #{corner[1]} ja #{corner[2]} kulma"
+
+    return path_to_finnish[location.name] or location.name or 'nimetön'
+
+step_to_finnish_speech = (step) ->
+    if step.relativeDirection and step.relativeDirection != "DEPART"
+       text = dir_to_finnish[step.relativeDirection] or step.relativeDirection
+    else
+       text = dir_to_finnish[step.absoluteDirection] or step.asboluteDirection
+
+    text += " " + (path_to_finnish[step.streetName] or step.streetName or 'nimetön')
+
+    return text
+
+display_step = (step) ->
+    icon = L.divIcon({className: "navigator-div-icon"})
+
+    marker = L.marker(new L.LatLng(step.lat, step.lon), {icon: icon}).addTo(routeLayer).bindLabel("#{((step.relativeDirection and step.relativeDirection != "DEPART") or step.absoluteDirection).toLowerCase().replace('_', ' ')} on #{step.streetName or 'unnamed path'}", {noHide: true}).showLabel()
+
+
+simulation_step = (itinerary, time) ->
+    simulation_timeoutId = setTimeout (-> simulation_step itinerary, time+simulation_timestep), 1000
+    # XXX how to switch itinerary?
+
+    citynavi.set_simulation_time moment(time)
+
+    leg = null
+
+    for l in itinerary.legs
+        if l.startTime <= time < l.endTime # this leg is in progress
+            leg = l
+
+    if time < itinerary.legs[0].startTime
+        leg =
+            startTime: itinerary.startTime
+            endTime: itinerary.legs[0].startTime
+            legGeometry:
+                points:
+                    [[sourceMarker.getLatLng().lat*1e5, sourceMarker.getLatLng().lng*1e5]]
+    else if time >= itinerary.legs[itinerary.legs.length-1].endTime
+        leg =
+            startTime: itinerary.legs[itinerary.legs.length-1].endTime
+            endTime: itinerary.endTime
+            legGeometry:
+                points:
+                    [[targetMarker.getLatLng().lat*1e5, targetMarker.getLatLng().lng*1e5]]
+
+    if not leg?
+        console.log "No current leg"
+        return
+
+    if not lastLeg?
+        display_detail "Instructions start at "+itinerary.legs[0].from.name+"."
+        speak "Ohjeet alkavat kadulta "+ location_to_finnish(itinerary.legs[0].from)
+        if itinerary.legs[0].steps?[0]
+            currentStep = itinerary.legs[0].steps?[0]
+            currentStepIndex = 0
+            display_step(currentStep)
+            console.log "current step", currentStep
+
+    if leg != lastLeg and leg?.steps?[0]
+        currentStep = leg.steps[0]
+        currentStepIndex = 0
+
+    lastLeg = leg
+    legIndex = itinerary.legs.indexOf(leg)+1
+
+    geometry = ([p[0]*1e-5, p[1]*1e-5] for p in leg.legGeometry.points)
+
+    share = (time-leg.startTime) / (leg.endTime-leg.startTime)
+
+    if geometry.length > 1 and share != 0
+        {latLng, predecessor} = L.GeometryUtil.interpolateOnLine(map, geometry, share)
+    else
+        [latLng, predecessor] = [L.latLng(geometry[0]), -1]
+
+#    console.log leg, leg.startTime-itinerary.startTime, time-itinerary.startTime, leg.endTime-itinerary.startTime, {points: geometry}, share, "->", latLng.toString(), predecessor
+
+    if currentStep? && latLng.distanceTo(new L.LatLng(currentStep.lat, currentStep.lon)) < 5
+        step = currentStep
+        display_detail "Next, go #{((step.relativeDirection and step.relativeDirection != "DEPART") or step.absoluteDirection).toLowerCase().replace('_', ' ')} on #{step.streetName or 'unnamed path'}."
+        speak step_to_finnish_speech(step)
+        currentStepIndex = currentStepIndex + 1
+        currentStep = leg.steps?[currentStepIndex]
+
+        if not currentStep?
+            nextLeg = itinerary.legs?[legIndex+1]
+            console.log "nextLeg", nextLeg
+            if nextLeg?.steps?[0]
+                currentStep = nextLeg?.steps?[0]
+                currentStepIndex = 0
+            else
+                currentStep = null
+
+        if currentStep?
+            display_step currentStep
+        else
+            display_detail "Arriving at destination."
+            speak "Saavutaan perille"
+
+    accuracy = 50
+
+    map.fire 'locationfound', construct_locationfound_event(latLng, accuracy)
+
+
+construct_locationfound_event = (latLng, accuracy) ->
+    lat = latLng.lat
+    lng = latLng.lng
+
+    latAccuracy = 180 * accuracy / 40075017
+    lngAccuracy = latAccuracy / Math.cos(L.LatLng.DEG_TO_RAD * lat)
+    bounds = L.latLngBounds(
+        [lat - latAccuracy, lng - lngAccuracy],
+        [lat + latAccuracy, lng + lngAccuracy])
+    return {
+        accuracy: accuracy
+        latlng: L.latLng(lat, lng)
+        bounds: bounds
+    }

@@ -62,9 +62,10 @@ hel_servicemap_base_url = "http://www.hel.fi/palvelukarttaws/rest/v2/"
 defaults =
     hel_geocoder_address_url: hel_geocoder_base_url + "address/"
     hel_geocoder_poi_url: hel_geocoder_base_url + "poi/"
-    waag_url: "http://test-api.citysdk.waag.org/"
+    waag_url: "http://api.citysdk.waag.org/"
     google_url: "http://dev.hel.fi/geocoder/google/"
     nominatim_url: "http://open.mapquestapi.com/nominatim/v1/search.php"
+    bag42_url: "http://bag42.nl/api/v0/geocode/json"
     hel_servicemap_service_url: hel_servicemap_base_url + "service/"
     hel_servicemap_unit_url: hel_servicemap_base_url + "unit/"
     reittiopas_url: "http://tuukka.kapsi.fi/tmp/reittiopas.cgi?callback=?"
@@ -72,6 +73,8 @@ defaults =
     faye_url: "http://dev.hsl.fi:9002/faye"
 
     icon_base_path: "static/images/"
+
+    min_zoom: 10
 
     colors:
         hsl: hsl_colors
@@ -101,17 +104,11 @@ defaults =
             109: 'train_station2.svg'
 
     maps:
-        cloudmade:
-            name: "CloudMade"
-            url_template: 'http://{s}.tile.cloudmade.com/{key}/{style}/256/{z}/{x}/{y}.png'
-            opts:
-                attribution: 'Map data &copy; 2011 OpenStreetMap contributors, Imagery &copy; 2012 CloudMade'
-                key: 'BC9A493B41014CAABB98F0471D759707'
-                style: 998
         osm:
             name: "OpenStreetMap"
             url_template: 'http://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png'
             opts:
+                maxZoom: 19
                 attribution: 'Map data &copy; 2011 OpenStreetMap contributors'
         opencyclemap:
             name: "OpenCyclemap"
@@ -122,18 +119,21 @@ defaults =
             name: "MapQuest"
             url_template: 'http://otile{s}.mqcdn.com/tiles/1.0.0/map/{z}/{x}/{y}.jpg'
             opts:
+                maxZoom: 19
                 subdomains: '1234'
                 attribution: 'Map data &copy; 2013 OpenStreetMap contributors, Tiles Courtesy of <a href="http://www.mapquest.com/" target="_blank">MapQuest</a> <img src="http://developer.mapquest.com/content/osm/mq_logo.png">'
 
 tampere =
     name: "Tampere"
     country: "fi"
-    cities: ["Tampere"]
+    cities: ["Tampere", "Tammerfors"]
     google_autocomplete_append: "Tampere"
     bbox_ne: [61.8237444, 24.1064742]
     bbox_sw: [61.42863, 23.5611791]
     center: [61.4976348, 23.7688124]
-    otp_base_url: "http://dev.hsl.fi/tampere/opentripplanner-api-webapp/ws/"
+    otp_base_url: "http://192.168.1.81/otp-rest-servlet/ws/"
+    siri_url: "http://192.168.1.81/siriaccess/vm/json?operatorRef=TKL"
+    faye_url: null
     poi_muni_id: null
     waag_id: "admr.fi.tampere"
     poi_providers:
@@ -161,6 +161,7 @@ manchester =
     bbox_sw: [53.327332, -2.730550]
     center: [53.479167, -2.244167]
     otp_base_url: "http://dev.hsl.fi/manchester/opentripplanner-api-webapp/ws/"
+    siri_url: "http://dev.hsl.fi/siriaccess/vm/json?operatorRef=GMN"
     poi_muni_id: 44001
     waag_id: "admr.uk.gr.manchester"
     poi_providers:
@@ -184,11 +185,14 @@ manchester =
 helsinki =
     name: "Helsinki Region"
     country: "fi"
-    cities: ["Helsinki", "Vantaa", "Espoo", "Kauniainen", "Kerava", "Sipoo", "Kirkkonummi"]
+    cities: ["Helsinki", "Vantaa", "Espoo", "Kauniainen", "Kerava", "Sipoo", "Kirkkonummi", # names in finnish
+             "Helsingfors", "Vanda", "Esbo", "Grankulla", "Kervo", "Sibbo", "Kyrkslätt"
+    ] # names in swedish
     bbox_ne: [60.653728, 25.576590]
     bbox_sw: [59.903339, 23.692820]
     center: [60.170833, 24.9375]
     otp_base_url: "http://dev.hsl.fi/opentripplanner-api-webapp/ws/"
+    siri_url: "http://dev.hsl.fi/siriaccess/vm/json?operatorRef=HSL"
     poi_muni_id: null # XXX is this ok?
     waag_id: "admr.fi.uusimaa" # XXX should be HSL area
     poi_providers:
@@ -209,6 +213,34 @@ helsinki =
         ]
     autocompletion_providers: ["poi_categories", "history", "geocoder", "osm"]
 
+nl =
+    name: "Netherlands"
+    country: "nl"
+    cities: null
+    google_autocomplete_append: "Netherlands"
+    google_suffix: ", The Netherlands"
+    bbox_ne: [53.617498100000006, 13.43461]
+    bbox_sw: [43.554167, 2.35503]
+    center: [52.37832, 4.89973]
+    min_zoom: 8
+    otp_base_url: "http://144.76.26.165/amsterdam/otp-rest-servlet/ws/"
+    poi_muni_id: null
+    waag_id: "admr.nl.nederland"
+    poi_providers:
+        "waag": [
+            {type: "library"}
+            {type: "park"}
+            {type: "swimming_pool"}
+            {type: "restaurant"}
+            {type: "cafe"}
+            {type: "bar"}
+            {type: "pub"}
+            {type: "supermarket"}
+            {type: "toilet"}
+            {type: "recycling"}
+        ]
+    autocompletion_providers: ["poi_categories", "osm", "bag42", "google"]
+
 
 # Save and set configuration.
 #############################
@@ -218,9 +250,10 @@ citynavi.update_configs {
     helsinki
     manchester
     tampere
+    nl
 }
 
-citynavi.set_config("manchester")
+citynavi.set_config("tampere")
 
 
 # Attempt to load local configuration.

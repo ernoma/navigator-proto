@@ -25,15 +25,17 @@ $(document).bind "mobileinit", ->
 
 # Show page loading message for user when making AJAX call and hide the message after (all)
 # AJAX requests have completed
-$(document).ajaxStart (e) ->
-    $.mobile.loading('show')
+    $(document).ajaxStart (e) ->
+        $.mobile.loading('show')
 
-$(document).ajaxStop (e) ->
-    $.mobile.loading('hide')
+    $(document).ajaxStop (e) ->
+        $.mobile.loading('hide')
 
 class CityNavigator
     constructor: (opts) ->
         @source_location = null
+        @simulation_time = null
+        @itinerary = null
         _.extend @, opts # Use underscore.js to exten the CityNavigator with the opts
     get_source_location: ->
         return @source_location
@@ -41,6 +43,14 @@ class CityNavigator
         return @source_location or @config.center
     set_source_location: (loc) ->
         @source_location = loc
+    set_simulation_time: (time) ->
+        @simulation_time = time
+    time: ->
+        return @simulation_time or moment()
+    get_itinerary: ->
+        return @itinerary
+    set_itinerary: (itinerary) ->
+        @itinerary = itinerary
 
 # The area for which the city-navigator is configured to.
 window.citynavi = new CityNavigator()
